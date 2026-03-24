@@ -1,9 +1,10 @@
 ---
 name: voice-to-doc
 description: >
-  Транскрибирует аудио/видео файл (m4a, mp3, mp4, wav) или YouTube/любую видео-ссылку
-  через Groq Whisper API (быстро, бесплатно), извлекает ключевые поинты и список задач через Claude,
-  создаёт новый Google Document в папке "Транскрипты" на Google Drive и записывает всё туда.
+  Транскрибирует аудио/видео файл (m4a, mp3, mp4, wav) или YouTube/любую видео-ссылку.
+  Использует каскад облачных сервисов: Groq → SaluteSpeech → AssemblyAI → Deepgram → локальный Whisper.
+  Извлекает ключевые поинты и список задач через Claude.
+  Перед началом всегда спрашивает: куда выдать результат — в чат или в Google Doc.
   В конце всегда показывает ключевые поинты и задачи прямо в чате.
 
   Триггеры: "/voice-to-doc", "транскрибируй файл", "сделай транскрипт", "расшифруй аудио",
@@ -26,21 +27,54 @@ allowed-tools:
 
 ## Стек
 
-- **Транскрипция**: Groq Whisper API (`whisper-large-v3`) — бесплатно, ~5 сек на файл
+- **Транскрипция**: каскад Groq → SaluteSpeech → AssemblyAI → Deepgram → локальный Whisper
 - **Анализ**: Claude (извлечение поинтов и задач из транскрипта)
 - **Публикация**: Google Apps Script (запускается прямо в браузере, без OAuth/credentials)
 
 ## Ключи
 
-Хранятся в `~/.claude/skills/voice-to-doc/.env` (не в git):
+Хранятся в `~/.env` (глобальный файл, не в git):
 
 ```
-GROQ_API_KEY=<твой ключ с console.groq.com>
+GROQ_API_KEY=
+SALUTE_SPEECH_API_KEY=
+ASSEMBLYAI_API_KEY=
+DEEPGRAM_API_KEY=
 ```
 
-Перед запуском скилл читает ключ из `.env`:
+Перед запуском загрузить все ключи:
 ```bash
-export $(cat ~/.claude/skills/voice-to-doc/.env | xargs)
+export $(grep -v '^#' ~/.env | xargs) 2>/dev/null
+```
+
+### Если у пользователя нет ключей
+
+Проверить наличие каждого ключа и для отсутствующих — вывести инструкцию:
+
+```
+Для работы скилла нужен хотя бы один API ключ для транскрипции.
+
+🟢 Groq (рекомендую — быстрый и бесплатный):
+   → Зарегистрируйся на https://console.groq.com
+   → После входа: API Keys → Create API Key
+   → Добавь в ~/.env: GROQ_API_KEY=твой_ключ
+
+🔵 SaluteSpeech (Сбер, 240 мин/мес бесплатно):
+   → https://developers.sber.ru/portal/products/smartspeech
+   → Создай проект → получи Client ID и Secret → закодируй в Base64
+   → Добавь в ~/.env: SALUTE_SPEECH_API_KEY=base64_строка
+
+🟡 AssemblyAI (бесплатный старт):
+   → https://www.assemblyai.com
+   → Sign Up → скопируй API Key с главной страницы
+   → Добавь в ~/.env: ASSEMBLYAI_API_KEY=твой_ключ
+
+🟠 Deepgram ($200 бесплатных кредитов):
+   → https://console.deepgram.com
+   → Sign Up → Create API Key
+   → Добавь в ~/.env: DEEPGRAM_API_KEY=твой_ключ
+
+Когда добавишь хотя бы один — напиши мне, запущу транскрипцию!
 ```
 
 Папка на Google Drive: `1Fy76Ezh4RkpxyIkcjCnp4p-eE11dSpYU` (Транскрипты)
@@ -48,16 +82,30 @@ Apps Script проект: `1Kbd8HYag_t_PMwjkj60eCl19ZsMlG7xn3jPuU432Jaq4rY3JUDZe
 
 ## Процесс работы
 
-### Шаг 0: Уточнение источника
+### Шаг 0: Уточнение источника и формата вывода
 
-**ВСЕГДА спрашивать перед началом** если источник не указан явно:
+**ВСЕГДА спрашивать перед началом** два вопроса (можно одним сообщением):
 
+**Вопрос 1 — источник** (если не указан явно):
 ```
 AskUserQuestion:
 - Скинь файл сюда (перетащи в чат)
 - Взять из iCloud VoiceToClonde (поиск по имени/дате)
 - YouTube или другая ссылка (вставь URL)
 ```
+
+**Вопрос 2 — куда выдать результат** (спрашивать ВСЕГДА, даже если источник указан):
+```
+AskUserQuestion:
+Куда выдать результат?
+1. 💬 В чат — таймкоды, ключевые поинты и транскрипт прямо здесь
+2. 📄 Google Doc — создать документ в папке "Транскрипты" на Drive
+```
+
+В зависимости от ответа:
+- **В чат**: выдать таймкоды, ключевые поинты и полный транскрипт блоками прямо в сообщении. Google Doc не создавать.
+- **Google Doc**: создать документ через Apps Script, в чат вывести только ключевые поинты + ссылку на документ.
+- **Оба**: и в чат, и в Google Doc.
 
 Поиск файла в iCloud VoiceToClonde:
 ```bash
@@ -90,35 +138,183 @@ ffmpeg -i /tmp/vtd_audio.mp3 -b:a 32k /tmp/vtd_audio_small.mp3
 ```
 - Далее передать `/tmp/vtd_audio.mp3` на транскрипцию
 
-### Шаг 1б: Транскрипция через Groq Whisper API
+### Шаг 1б: Транскрипция — каскад облачных сервисов
 
-Сначала загрузить ключ:
+Ключи берутся из `~/.env` (глобальный файл). Сначала загрузить все доступные ключи:
 ```bash
-export $(cat ~/.claude/skills/voice-to-doc/.env | xargs)
+export $(grep -v '^#' ~/.env | xargs) 2>/dev/null
 ```
+
+**Порядок попыток: Groq → SaluteSpeech → AssemblyAI → Deepgram → локальный Whisper**
+
+После определения длины файла — сообщить пользователю:
+```
+⏳ Начинаю транскрипцию...
+   Файл: [имя файла], [длительность]
+   Сервис: Groq Whisper — ожидаемое время: ~10 сек
+```
+
+При переключении на следующий сервис — сообщить:
+```
+⚠️ Groq недоступен (лимит). Переключаюсь на SaluteSpeech — ожидаемое время: ~1-2 мин
+```
+
+Когда готово:
+```
+✅ Транскрипция готова за X сек через [сервис]. Анализирую...
+```
+
+Перед запуском извлечь аудио из видео (если нужно) и сжать до mp3 64k чтобы файл был легче:
+```bash
+ffmpeg -i input.mp4 -vn -ar 16000 -ac 1 -b:a 64k /tmp/vtd_audio.mp3 -y
+```
+
+---
+
+#### Попытка 1: Groq Whisper API (быстро, ~5 сек)
 
 ```python
 from groq import Groq
 import os
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
 with open(file_path, "rb") as f:
     transcription = client.audio.transcriptions.create(
         file=(os.path.basename(file_path), f.read()),
         model="whisper-large-v3",
-        language="ru",   # или другой язык
+        language="ru",
         response_format="text"
     )
-
 text = transcription.strip()
-with open("/tmp/vtd_transcript.txt", "w") as out:
-    out.write(text)
 ```
 
-- Модель: `whisper-large-v3` — лучшее качество
-- Лимит: 2 часа аудио в день бесплатно
-- Скорость: ~5 секунд на любой файл
+Если Groq вернул ошибку лимита (rate limit / quota) → переходить к Попытке 2.
+
+---
+
+#### Попытка 2: SaluteSpeech (Сбер) — если есть SALUTE_SPEECH_API_KEY
+
+```python
+import requests, uuid, json, time
+requests.packages.urllib3.disable_warnings()
+
+auth_key = os.getenv("SALUTE_SPEECH_API_KEY")
+
+def get_salute_token():
+    resp = requests.post(
+        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+        headers={"Authorization": f"Basic {auth_key}", "RqUID": str(uuid.uuid4()),
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"scope": "SALUTE_SPEECH_PERS"}, verify=False
+    )
+    return resp.json()["access_token"]
+
+token = get_salute_token()
+
+# Загрузить файл
+with open(file_path, "rb") as f:
+    resp = requests.post("https://smartspeech.sber.ru/rest/v1/data:upload",
+        headers={"Authorization": f"Bearer {token}"}, data=f, verify=False)
+audio_id = resp.json()["result"]["request_file_id"]
+
+# Запустить распознавание
+resp = requests.post("https://smartspeech.sber.ru/rest/v1/speech:async_recognize",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    json={"options": {"language": "ru-RU", "audio_encoding": "MP3", "hypotheses_count": 1},
+          "request_file_id": audio_id}, verify=False)
+task_id = resp.json()["result"]["id"]
+
+# Ждать результат (обычно 30-60 сек)
+for i in range(60):
+    time.sleep(10)
+    if i % 6 == 0:
+        token = get_salute_token()  # токен живёт 30 мин
+    resp = requests.get(f"https://smartspeech.sber.ru/rest/v1/task:get?id={task_id}",
+        headers={"Authorization": f"Bearer {token}"}, verify=False)
+    status = resp.json().get("result", {}).get("status")
+    if status == "DONE":
+        file_id = resp.json()["result"]["response_file_id"]
+        resp2 = requests.get(f"https://smartspeech.sber.ru/rest/v1/data:download?response_file_id={file_id}",
+            headers={"Authorization": f"Bearer {token}"}, verify=False)
+        chunks = resp2.json()
+        text = " ".join(r.get("normalized_text", r.get("text",""))
+                        for chunk in chunks for r in chunk.get("results", []))
+        break
+    elif status == "ERROR":
+        raise Exception("SaluteSpeech error")
+```
+
+Если SaluteSpeech недоступен или вернул ошибку → переходить к Попытке 3.
+
+---
+
+#### Попытка 3: AssemblyAI — если есть ASSEMBLYAI_API_KEY
+
+```python
+import requests, time
+
+API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+headers = {"Authorization": API_KEY, "Content-Type": "application/json"}
+
+# Загрузить файл
+with open(file_path, "rb") as f:
+    r = requests.post("https://api.assemblyai.com/v2/upload",
+        headers={"Authorization": API_KEY}, data=f)
+audio_url = r.json()["upload_url"]
+
+# Запустить транскрипцию
+r = requests.post("https://api.assemblyai.com/v2/transcript", headers=headers,
+    json={"audio_url": audio_url, "language_code": "ru", "speech_models": ["universal-2"]})
+tid = r.json()["id"]
+
+# Ждать результат
+for _ in range(60):
+    time.sleep(10)
+    r = requests.get(f"https://api.assemblyai.com/v2/transcript/{tid}", headers=headers)
+    if r.json()["status"] == "completed":
+        text = r.json()["text"]
+        break
+    elif r.json()["status"] == "error":
+        raise Exception("AssemblyAI error")
+```
+
+---
+
+#### Попытка 4: Deepgram — если есть DEEPGRAM_API_KEY
+
+```python
+import requests
+
+API_KEY = os.getenv("DEEPGRAM_API_KEY")
+with open(file_path, "rb") as f:
+    resp = requests.post(
+        "https://api.deepgram.com/v1/listen?model=nova-2&language=ru&punctuate=true",
+        headers={"Authorization": f"Token {API_KEY}", "Content-Type": "audio/mp3"},
+        data=f
+    )
+text = resp.json()["results"]["channels"][0]["alternatives"][0]["transcript"]
+```
+
+- $200 бесплатных кредитов при регистрации (~2000 часов)
+- Скорость: ~10-30 сек на файл
+- Русский: поддерживается через модель `nova-2`
+
+---
+
+#### Попытка 5: Локальный Whisper — только если все облака недоступны
+
+Предупредить пользователя: «Облачные сервисы недоступны. Запускаю локальный Whisper — это займёт 20-40 минут для длинных записей.»
+
+```bash
+python3 -m whisper "input.mp3" --language Russian --model small \
+  --output_format txt --output_dir /tmp/vtd_whisper_out
+```
+
+Если через 10 минут файл результата ещё не появился — напомнить пользователю что процесс идёт и предложить подождать или прервать.
+
+---
+
+После успешной транскрипции любым методом — сохранить в `/tmp/vtd_transcript.txt`.
 
 ### Шаг 2: Анализ транскрипта (Claude сам делает)
 
@@ -196,6 +392,16 @@ function writeToDoc() {
 
 ### Шаг 4: Отчёт пользователю
 
+**Режим "в чат":**
+Выдать в сообщении:
+- Таймкоды (если запрашивались)
+- Ключевые поинты
+- Список задач (если есть)
+- Полный транскрипт блоками с таймкодами
+
+Google Doc не создавать.
+
+**Режим "Google Doc":**
 ```
 ✅ Готово!
 📄 Новый документ создан в папке "Транскрипты":
@@ -209,6 +415,8 @@ function writeToDoc() {
 ✅ Задачи (N):
 • ...
 ```
+
+**Режим "оба":** сначала Google Doc, затем выдать всё в чат.
 
 ## Команды запуска
 
